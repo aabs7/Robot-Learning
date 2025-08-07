@@ -1,6 +1,4 @@
 import torch
-import torch.nn as nn
-import numpy as np
 import gymnasium as gym
 from utils import PolicyNetwork, ValueNetwork, collect_trajectory, evaluate_policy
 
@@ -66,14 +64,19 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--num_epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=5000)
+    parser.add_argument('--policy_epochs', type=int, default=80)
+    parser.add_argument('--value_epochs', type=int, default=80)
+    parser.add_argument('--clip_eps', type=float, default=0.2)
     parser.add_argument('--just_evaluate', action='store_true', default=False, help='Just evaluate the policy without training')
     args = parser.parse_args()
 
     if not args.just_evaluate:
         env = gym.make(args.env_name)
+        assert isinstance(env.action_space, gym.spaces.Discrete), "This implementation only supports discrete action spaces."
+        assert isinstance(env.observation_space, gym.spaces.Box), "This implementation only supports continuous observation spaces."
         print("Environment created:", env.spec.id)
         print("Training ...")
-        train_ppo(env, args.batch_size, args.num_epochs, args.gamma, args.lr)
+        train_ppo(env, args.batch_size, args.num_epochs, args.gamma, args.lr, args.policy_epochs, args.value_epochs, args.clip_eps)
         env.close()
 
     print("Evaluating ...")

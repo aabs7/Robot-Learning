@@ -1,6 +1,4 @@
 import torch
-import torch.nn as nn
-import numpy as np
 import gymnasium as gym
 from utils import PolicyNetwork, collect_trajectory, evaluate_policy
 
@@ -31,7 +29,7 @@ def train_policy_gradient(env, batch_size=5000, num_epochs=1000, gamma=0.99, lr=
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env_name', type=str, default='CartPole-v1')
+    parser.add_argument('--env_name', type=str, default='LunarLander-v3')
     parser.add_argument('--lr', type=float, default=1e-2)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--num_epochs', type=int, default=200)
@@ -46,11 +44,8 @@ if __name__ == "__main__":
         assert isinstance(env.action_space, gym.spaces.Discrete), "This implementation only supports discrete action spaces."
         assert isinstance(env.observation_space, gym.spaces.Box), "This implementation only supports continuous observation spaces."
 
-        obs_dim = env.observation_space.shape[0]
-        n_actions = env.action_space.n
-        logits_net = PolicyNetwork(obs_dim, n_actions)
+        print("Training ...")
         train_policy_gradient(env, args.batch_size, args.num_epochs, args.gamma, args.lr)
-        torch.save(logits_net.state_dict(), f"{args.env_name}_policy.pth")
         env.close()
         print("Policy saved to file.")
 

@@ -1,6 +1,4 @@
 import torch
-import torch.nn as nn
-import numpy as np
 import gymnasium as gym
 from utils import PolicyNetwork, ValueNetwork, collect_trajectory, evaluate_policy
 
@@ -47,7 +45,7 @@ def train_policy_gradient_with_advantage(env, batch_size=5000, num_epochs=1000, 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env_name', type=str, default='CartPole-v1')
+    parser.add_argument('--env_name', type=str, default='LunarLander-v3')
     parser.add_argument('--lr', type=float, default=1e-2)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--num_epochs', type=int, default=200)
@@ -58,6 +56,9 @@ if __name__ == '__main__':
     if not args.just_evaluate:
         env = gym.make(args.env_name)
         print("Environment created:", env.spec.id)
+        assert isinstance(env.action_space, gym.spaces.Discrete), "This implementation only supports discrete action spaces."
+        assert isinstance(env.observation_space, gym.spaces.Box), "This implementation only supports continuous observation spaces."
+
         print("Training ...")
         train_policy_gradient_with_advantage(env, args.batch_size, args.num_epochs, args.gamma, args.lr)
         env.close()
