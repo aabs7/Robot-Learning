@@ -5,7 +5,7 @@ import gymnasium as gym
 from utils import PolicyNetwork, ValueNetwork, collect_trajectory, evaluate_policy
 
 
-def train_policy_gradient_with_advantage(env, batch_size=5000, num_epochs=1000, gamma=0.99, lr=1e-3, policy_epochs=80, value_epochs=80, clip_eps=0.2):
+def train_ppo(env, batch_size=5000, num_epochs=1000, gamma=0.99, lr=1e-3, policy_epochs=80, value_epochs=80, clip_eps=0.2):
     print(f"Training in {env.spec.id}")
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
@@ -43,7 +43,7 @@ def train_policy_gradient_with_advantage(env, batch_size=5000, num_epochs=1000, 
             policy_optimizer.step()
 
         # Value function fit
-        for _ in range(80):
+        for _ in range(value_epochs):
             value_pred = value_net(trajectory['observations']) # replacing variable so no gradient tracking from above
             value_loss = ((value_pred - trajectory['rewards']) ** 2).mean()
             value_optimizer.zero_grad()
@@ -54,14 +54,14 @@ def train_policy_gradient_with_advantage(env, batch_size=5000, num_epochs=1000, 
         old_policy_net.load_state_dict(policy_net.state_dict())
 
         print(f"Epoch {epoch}: Policy Loss = {policy_loss.item():.3f}, Value Loss = {value_loss.item():.3f}")
-    torch.save(policy_net.state_dict(), f'{env.spec.id}_advantage_policy_net.pth')
+    torch.save(policy_net.state_dict(), f'{env.spec.id}_ppo_policy_net.pth')
 
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env_name', type=str, default='CartPole-v1')
+    parser.add_argument('--env_name', type=str, default='LunarLander-v3')
     parser.add_argument('--lr', type=float, default=1e-2)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--num_epochs', type=int, default=200)
@@ -73,7 +73,7 @@ if __name__ == '__main__':
         env = gym.make(args.env_name)
         print("Environment created:", env.spec.id)
         print("Training ...")
-        train_policy_gradient_with_advantage(env, args.batch_size, args.num_epochs, args.gamma, args.lr)
+        train_ppo(env, args.batch_size, args.num_epochs, args.gamma, args.lr)
         env.close()
 
     print("Evaluating ...")
@@ -81,5 +81,5 @@ if __name__ == '__main__':
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
     policy_net = PolicyNetwork(obs_dim, action_dim)
-    policy_net.load_state_dict(torch.load(f'{env.spec.id}_advantage_policy_net.pth'))
+    policy_net.load_state_dict(torch.load(f'{env.spec.id}_ppo_policy_net.pth'))
     evaluate_policy(env, policy_net)
