@@ -4,3 +4,4 @@ venv/
 *.pkl
 *.zip
 *tensorboard/
+data_src/
