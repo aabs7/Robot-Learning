@@ -4,3 +4,5 @@ numpy
 matplotlib
 gymnasium[all]
 ipykernel
+h5py
+stable-baselines3[extra]

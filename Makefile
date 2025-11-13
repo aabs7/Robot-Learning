@@ -1,12 +1,9 @@
-VENV := venv
-VENV_PYTHON = $(VENV)/bin/python3
-VENV_PIP = $(VENV)/bin/pip
+PYTHON_VERSION := 3.9
 
 .PHONY: build
 build: requirements.txt
 	@git submodule update --init --recursive
-	@python3 -m venv $(VENV)
-	@$(VENV_PIP) install -r requirements.txt
-	@$(VENV_PIP) install -r robosuite/requirements.txt
-	@$(VENV_PIP) install -r robosuite/requirements-extra.txt
-	@$(VENV_PIP) install robosuite/
+	@uv venv --python ${PYTHON_VERSION}
+	@uv sync
+	@uv pip install -r robosuite/requirements-extra.txt
+	@uv pip install -r requirements.txt

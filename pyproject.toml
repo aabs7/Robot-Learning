@@ -1,0 +1,12 @@
+[project]
+name = "robot-learning"
+version = "0.1.0"
+description = "Add description here"
+requires-python = ">=3.9"
+
+dependencies = [
+    "robosuite",
+]
+
+[tool.uv.sources]
+robosuite = { path = "./robosuite" }
