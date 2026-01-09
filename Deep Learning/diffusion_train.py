@@ -35,92 +35,130 @@ def log_images(writer, images, labels, nrow, step):
     plt.close(fig)
 
 
-def timestep_embedding(timesteps, dim, max_period=10000):
-    """
-    timesteps: (B,)
-    returns: (B, dim)
-    """
-    half = dim // 2
-    freqs = torch.exp(
-        -math.log(max_period) * torch.arange(0, half, device=timesteps.device) / half
-    )
-    args = timesteps[:, None] * freqs[None]
-    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-        emb = F.pad(emb, (0, 1))
-    return emb
-
-
-class ResBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, time_emb_dim, dropout=0.1):
+class SinusoidalTimeEmbedding(nn.Module):
+    def __init__(self, dim):
         super().__init__()
+        self.dim = dim
 
-        self.norm1 = nn.GroupNorm(8, in_ch)
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+    def forward(self, t):
+        device = t.device
+        half = self.dim // 2
+        emb = math.log(10000) / (half - 1)
+        emb = torch.exp(torch.arange(half, device=device) * -emb)
+        emb = t[:, None] * emb[None, :]
+        emb = torch.cat([emb.sin(), emb.cos()], dim=1)
+        return emb
 
-        self.time_proj = nn.Linear(time_emb_dim, out_ch)
 
-        self.norm2 = nn.GroupNorm(8, out_ch)
-        self.dropout = nn.Dropout(dropout)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+class TimeClassEmbedding(nn.Module):
+    def __init__(self, time_dim, num_classes):
+        super().__init__()
+        self.time_mlp = nn.Sequential(
+            SinusoidalTimeEmbedding(time_dim),
+            nn.Linear(time_dim, time_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_dim * 4, time_dim),
+        )
+        self.class_emb = nn.Embedding(num_classes, time_dim)
 
-        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+    def forward(self, t, y):
+        '''
+        t: (B, ) tensor of timesteps
+        y: (B, ) tensor of class labels
+        '''
+        t_emb = self.time_mlp(t)
+        y_emb = self.class_emb(y)
+        return t_emb + y_emb
 
-    def forward(self, x, t_emb):
-        h = self.conv1(F.silu(self.norm1(x)))
-        h = h + self.time_proj(t_emb)[:, :, None, None]
-        h = self.conv2(self.dropout(F.silu(self.norm2(h))))
-        return h + self.skip(x)
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, cond_dim):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
+        self.cond_proj = nn.Linear(cond_dim, out_ch)
+        self.activation = nn.SiLU()
+
+    def forward(self, x, cond_emb):
+        h = self.activation(self.conv1(x))
+        h = h + self.cond_proj(cond_emb)[:, :, None, None]
+        h = self.activation(self.conv2(h))
+        return h
+
+
+class UnetDown(nn.Module):
+    def __init__(self, in_ch, out_ch, cond_dim):
+        super().__init__()
+        '''Downscale the image features'''
+        self.conv = ConvBlock(in_ch, out_ch, cond_dim)
+        self.pool = nn.MaxPool2d(2)
+
+    def forward(self, x, cond_emb):
+        x = self.conv(x, cond_emb)
+        skip = x
+        x = self.pool(x)
+        return x, skip
+
+
+class UnetUp(nn.Module):
+    def __init__(self, in_ch, out_ch, cond_dim):
+        super().__init__()
+        '''Upscale the image features'''
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.conv = ConvBlock(in_ch=out_ch*2, out_ch=out_ch, cond_dim=cond_dim)
+
+    def forward(self, x, skip, cond_emb):
+        x = self.up(x)
+        x = torch.cat([x, skip], dim=1) # concatenate along channel dimension
+        x = self.conv(x, cond_emb)
+        return x
 
 
 class UNet(nn.Module):
-    def __init__(self, in_ch=1, out_ch=1, base_ch=32, time_emb_dim=128, cond_emb_dim=32):
+    def __init__(self, in_ch=1, base_channels=128, num_classes=10, cond_dim=256):
         super().__init__()
 
-        self.time_emb_dim = time_emb_dim
+        self.cond_embedding = TimeClassEmbedding(cond_dim, num_classes)
 
-        self.time_mlp = nn.Sequential(
-            nn.Linear(time_emb_dim, time_emb_dim * 4),
-            nn.SiLU(),
-            nn.Linear(time_emb_dim * 4, time_emb_dim),
-        )
+        # encoder
+        self.down1 = UnetDown(in_ch, base_channels, cond_dim)
+        self.down2 = UnetDown(base_channels, base_channels * 2, cond_dim)
+        self.down3 = UnetDown(base_channels * 2, base_channels * 4, cond_dim)
 
-        self.cond_proj = nn.Linear(10, cond_emb_dim)
+        # bottleneck
+        self.bottleneck = ConvBlock(base_channels * 4, base_channels * 8, cond_dim)
 
-        self.input_conv = nn.Conv2d(in_ch, base_ch, 3, padding=1)
+        # decoder
+        self.up3 = UnetUp(base_channels * 8, base_channels * 4, cond_dim)
+        self.up2 = UnetUp(base_channels * 4, base_channels * 2, cond_dim)
+        self.up1 = UnetUp(base_channels * 2, base_channels, cond_dim)
 
-        self.down1 = ResBlock(base_ch, base_ch, time_emb_dim + cond_emb_dim)
-        self.down2 = ResBlock(base_ch, base_ch * 2, time_emb_dim + cond_emb_dim)
-        self.pool = nn.AvgPool2d(2)
+        # output
+        self.out_conv = nn.Conv2d(base_channels, in_ch, kernel_size=1)
 
-        self.mid = ResBlock(base_ch * 2, base_ch * 2, time_emb_dim + cond_emb_dim)
-        self.up = nn.Upsample(scale_factor=2, mode="nearest")
 
-        self.up1 = ResBlock(base_ch * 3, base_ch, time_emb_dim + cond_emb_dim)
+    def forward(self, x, t, y):
+        '''
+        x: (B, C, H, W) noisy image
+        t: (B, ) timesteps
+        y: (B, ) class labels
+        '''
 
-        self.out_norm = nn.GroupNorm(8, base_ch)
-        self.out_conv = nn.Conv2d(base_ch, out_ch, 3, padding=1)
+        cond_embed = self.cond_embedding(t, y)
+        x, s1 = self.down1(x, cond_embed)
+        x, s2 = self.down2(x, cond_embed)
+        x, s3 = self.down3(x, cond_embed)
+        x = self.bottleneck(x, cond_embed)
 
-    def forward(self, x, t, cond):
-        t_emb = timestep_embedding(t, self.time_emb_dim)
-        t_emb = self.time_mlp(t_emb)
-        cond_emb = self.cond_proj(cond)
-        cat_emb = torch.cat([t_emb, cond_emb], dim=1)
-        x = self.input_conv(x)
+        x = self.up3(x, s3, cond_embed)
+        x = self.up2(x, s2, cond_embed)
+        x = self.up1(x, s1, cond_embed)
 
-        d1 = self.down1(x, cat_emb)           # [B, 32, 32, 32]
-        d2 = self.down2(self.pool(d1), cat_emb)  # [B, 64, 16, 16]
-
-        m = self.mid(d2, cat_emb)             # [B, 64, 16, 16]
-
-        u = self.up(m)                      # [B, 64, 32, 32]
-        u = torch.cat([u, d1], dim=1)       # [B, 96, 32, 32]
-        u = self.up1(u, cat_emb)              # [B, 32, 32, 32]
-        return self.out_conv(F.silu(self.out_norm(u)))
+        return self.out_conv(x)
 
 
 class SimpleDiffusionModel(nn.Module):
-    def __init__(self, T, num_channels=3, device="cpu"):
+    def __init__(self, T, num_channels=3, num_classes=10, device="cpu"):
         super().__init__()
         self.T = T
         self.device = device
@@ -128,13 +166,13 @@ class SimpleDiffusionModel(nn.Module):
 
         self.unet = UNet(
             in_ch=num_channels,
-            out_ch=num_channels,
-            base_ch=32,
-            time_emb_dim=128,
+            base_channels=128,
+            num_classes=num_classes,
+            cond_dim=256
         ).to(device)
 
-    def forward(self, x, t, cond):
-        return self.unet(x, t, cond)  # predicted noise
+    def forward(self, x, t, y):
+        return self.unet(x, t, y)  # predicted noise
 
     def loss(self, predicted_noise, actual_noise, writer=None, index=0):
         loss = F.mse_loss(predicted_noise, actual_noise)
@@ -176,19 +214,25 @@ class SimpleDiffusionModel(nn.Module):
             return x + torch.sqrt(self.betas[t[0]]) * noise
 
 
-def sample_image(model, img_shape, cond, device, n=8):
+def sample_image(model, img_shape, labels, device):
+    n = len(labels)
     model.eval()
     with torch.no_grad():
         x_t = torch.randn((n, *img_shape), device=device)
         for t in reversed(range(model.T)):
             t_batch = torch.tensor([t] * n, device=device)
-            cond_batch = cond[:n]
-            x_t = model.p_sample(x_t, t_batch, cond_batch)
+            x_t = model.p_sample(x_t, t_batch, labels)
 
     return x_t
 
 
 if __name__ == "__main__":
+    # Hyperparameters
+    T = 1000
+    B = 64
+    lr = 1e-3
+    epochs = 200
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     transform = transforms.Compose([transforms.Resize((32, 32)),
@@ -201,57 +245,61 @@ if __name__ == "__main__":
     # test_data = datasets.CIFAR10(root='./data_src', train=False, download=True, transform=transform)
     IMG_SHAPE = (1, 32, 32)
     training_dataloader = DataLoader(training_data,
-                                     batch_size=64,
+                                     batch_size=B,
                                      shuffle=True,
                                      drop_last=True)
     test_dataloader = DataLoader(test_data,
-                                 batch_size=64,
+                                 batch_size=B,
                                  shuffle=False,
                                  drop_last=True)
     test_loader_iter = iter(test_dataloader)
 
-    T = 200  # number of diffusion steps
-    model = SimpleDiffusionModel(T, num_channels=IMG_SHAPE[0], device=device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    model = SimpleDiffusionModel(T, num_channels=IMG_SHAPE[0], num_classes=10, device=device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     train_writer = SummaryWriter(log_dir='runs/mnist/train')
     test_writer = SummaryWriter(log_dir='runs/mnist/test')
 
     step = 0
-    EPOCHS = 200
-    for epoch in range(EPOCHS):
-        for index, (x0, target) in enumerate(training_dataloader):
+    for epoch in range(epochs):
+        for index, (images, labels) in enumerate(training_dataloader):
+            images = images.to(device)
+            labels = labels.to(device)
+
             model.train()
-            x0 = x0.to(device)
-            cond = torch.nn.functional.one_hot(target, num_classes=10).float().to(device)
-            t = torch.randint(0, T, (x0.shape[0],), device=device)
-            actual_noise = torch.randn_like(x0, device=device)
-            xt = model.q_sample(x0, t, actual_noise)  # noisy image
-            predicted_noise = model(xt, t, cond)
+            t = torch.randint(0, T, (B,), device=device)
+
+            actual_noise = torch.randn_like(images, device=device)
+
+            xt = model.q_sample(images, t, actual_noise)  # noisy image
+            predicted_noise = model(xt, t, labels)
             loss = model.loss(predicted_noise, actual_noise, writer=train_writer, index=step)
 
             if index % 100 == 0:
                 with torch.no_grad():
                     try:
                         tbatch = next(test_loader_iter)
+                        test_images, test_labels = tbatch
                     except StopIteration:
                         test_loader_iter = iter(test_dataloader)
-                        tbatch = next(test_loader_iter)
-                    x0_test = tbatch[0].to(device)
-                    target_test = tbatch[1].to(device)
-                    cond_test = torch.nn.functional.one_hot(target_test, num_classes=10).float().to(device)
-                    t_test = torch.randint(0, T, (x0_test.shape[0],), device=device)
-                    actual_noise_test = torch.randn_like(x0_test, device=device)
-                    xt_test = model.q_sample(x0_test, t_test, actual_noise_test)  # noisy image
-                    predicted_noise_test = model(xt_test, t_test, cond_test)
+                        test_images, test_labels = next(test_loader_iter)
+                    test_images = test_images.to(device)
+                    test_labels = test_labels.to(device)
+
+                    t_test = torch.randint(0, T, (test_images.shape[0],), device=device)
+                    actual_noise_test = torch.randn_like(test_images, device=device)
+                    xt_test = model.q_sample(test_images, t_test, actual_noise_test)  # noisy image
+                    predicted_noise_test = model(xt_test, t_test, test_labels)
                     test_loss = model.loss(predicted_noise_test, actual_noise_test, writer=test_writer, index=step)
-                    images = sample_image(model, IMG_SHAPE, cond_test, device, n=8)
-                    log_images(test_writer, images, target_test, nrow=2, step=step)
+
+                    n = 8 # 8 samples to generate
+                    images = sample_image(model, IMG_SHAPE, test_labels[:n], device)
+                    log_images(test_writer, images, test_labels[:n], nrow=2, step=step)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             step += 1
-        print(f'Epoch [{epoch+1}/{EPOCHS}] Step [{index+1}/{len(training_dataloader)}] Loss: {loss.item():.4f}')
+        print(f'Epoch [{epoch+1}/{epochs}] Step [{index+1}/{len(training_dataloader)}] Loss: {loss.item():.4f}')
 
     torch.save(model.state_dict(), 'simple_diffusion_model.pth')
