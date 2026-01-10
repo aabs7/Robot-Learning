@@ -11,6 +11,168 @@ import io
 from PIL import Image
 
 
+class ResidualConvBlock(nn.Module):
+    def __init__(
+        self, in_channels: int, out_channels: int, is_res: bool = False
+    ) -> None:
+        super().__init__()
+        '''
+        standard ResNet style convolutional block
+        '''
+        self.same_channels = in_channels==out_channels
+        self.is_res = is_res
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, 1, 1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, 3, 1, 1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.is_res:
+            x1 = self.conv1(x)
+            x2 = self.conv2(x1)
+            # this adds on correct residual in case channels have increased
+            if self.same_channels:
+                out = x + x2
+            else:
+                out = x1 + x2
+            return out / 1.414
+        else:
+            x1 = self.conv1(x)
+            x2 = self.conv2(x1)
+            return x2
+
+
+class UnetDown(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(UnetDown, self).__init__()
+        '''
+        process and downscale the image feature maps
+        '''
+        layers = [ResidualConvBlock(in_channels, out_channels), nn.MaxPool2d(2)]
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class UnetUp(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(UnetUp, self).__init__()
+        '''
+        process and upscale the image feature maps
+        '''
+        layers = [
+            nn.ConvTranspose2d(in_channels, out_channels, 2, 2),
+            ResidualConvBlock(out_channels, out_channels),
+            ResidualConvBlock(out_channels, out_channels),
+        ]
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x, skip):
+        x = torch.cat((x, skip), 1)
+        x = self.model(x)
+        return x
+
+
+class EmbedFC(nn.Module):
+    def __init__(self, input_dim, emb_dim):
+        super(EmbedFC, self).__init__()
+        '''
+        generic one layer FC NN for embedding things
+        '''
+        self.input_dim = input_dim
+        layers = [
+            nn.Linear(input_dim, emb_dim),
+            nn.GELU(),
+            nn.Linear(emb_dim, emb_dim),
+        ]
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = x.view(-1, self.input_dim)
+        return self.model(x)
+
+
+class ContextUnet(nn.Module):
+    def __init__(self, in_channels, n_feat = 256, n_classes=10):
+        super(ContextUnet, self).__init__()
+
+        self.in_channels = in_channels
+        self.n_feat = n_feat
+        self.n_classes = n_classes
+
+        self.init_conv = ResidualConvBlock(in_channels, n_feat, is_res=True)
+
+        self.down1 = UnetDown(n_feat, n_feat)
+        self.down2 = UnetDown(n_feat, 2 * n_feat)
+
+        self.to_vec = nn.Sequential(nn.AvgPool2d(7), nn.GELU())
+
+        self.timeembed1 = EmbedFC(1, 2*n_feat)
+        self.timeembed2 = EmbedFC(1, 1*n_feat)
+        self.contextembed1 = EmbedFC(n_classes, 2*n_feat)
+        self.contextembed2 = EmbedFC(n_classes, 1*n_feat)
+
+        self.up0 = nn.Sequential(
+            # nn.ConvTranspose2d(6 * n_feat, 2 * n_feat, 7, 7), # when concat temb and cemb end up w 6*n_feat
+            nn.ConvTranspose2d(2 * n_feat, 2 * n_feat, 7, 7), # otherwise just have 2*n_feat
+            nn.GroupNorm(8, 2 * n_feat),
+            nn.ReLU(),
+        )
+
+        self.up1 = UnetUp(4 * n_feat, n_feat)
+        self.up2 = UnetUp(2 * n_feat, n_feat)
+        self.out = nn.Sequential(
+            nn.Conv2d(2 * n_feat, n_feat, 3, 1, 1),
+            nn.GroupNorm(8, n_feat),
+            nn.ReLU(),
+            nn.Conv2d(n_feat, self.in_channels, 3, 1, 1),
+        )
+
+    # def forward(self, x, c, t, context_mask):
+    def forward(self, x, t, c):
+        # x is (noisy) image, c is context label, t is timestep,
+        # context_mask says which samples to block the context on
+        t = t.float()
+
+        x = self.init_conv(x)
+        down1 = self.down1(x)
+        down2 = self.down2(down1)
+        hiddenvec = self.to_vec(down2)
+
+        # convert context to one hot embedding
+        c = nn.functional.one_hot(c, num_classes=self.n_classes).type(torch.float)
+
+        # mask out context if context_mask == 1
+        # context_mask = context_mask[:, None]
+        # context_mask = context_mask.repeat(1,self.n_classes)
+        # context_mask = (-1*(1-context_mask)) # need to flip 0 <-> 1
+        # c = c * context_mask
+
+        # embed context, time step
+        cemb1 = self.contextembed1(c).view(-1, self.n_feat * 2, 1, 1)
+        # print(t.shape, t.dtype)
+        temb1 = self.timeembed1(t).view(-1, self.n_feat * 2, 1, 1)
+        cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1)
+        temb2 = self.timeembed2(t).view(-1, self.n_feat, 1, 1)
+
+        # could concatenate the context embedding here instead of adaGN
+        # hiddenvec = torch.cat((hiddenvec, temb1, cemb1), 1)
+
+        up1 = self.up0(hiddenvec)
+        # up2 = self.up1(up1, down2) # if want to avoid add and multiply embeddings
+        up2 = self.up1(cemb1*up1+ temb1, down2)  # add and multiply embeddings
+        up3 = self.up2(cemb2*up2+ temb2, down1)
+        out = self.out(torch.cat((up3, x), 1))
+        return out
+
+
 def log_images(writer, images, labels, nrow, step):
     grid_shape = (nrow, math.ceil(images.shape[0] / nrow))
     fig_size = (grid_shape[1] * 2, grid_shape[0] * 2)
@@ -35,127 +197,6 @@ def log_images(writer, images, labels, nrow, step):
     plt.close(fig)
 
 
-class SinusoidalTimeEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, t):
-        device = t.device
-        half = self.dim // 2
-        emb = math.log(10000) / (half - 1)
-        emb = torch.exp(torch.arange(half, device=device) * -emb)
-        emb = t[:, None] * emb[None, :]
-        emb = torch.cat([emb.sin(), emb.cos()], dim=1)
-        return emb
-
-
-class TimeClassEmbedding(nn.Module):
-    def __init__(self, time_dim, num_classes):
-        super().__init__()
-        self.time_mlp = nn.Sequential(
-            SinusoidalTimeEmbedding(time_dim),
-            nn.Linear(time_dim, time_dim * 4),
-            nn.SiLU(),
-            nn.Linear(time_dim * 4, time_dim),
-        )
-        self.class_emb = nn.Embedding(num_classes, time_dim)
-
-    def forward(self, t, y):
-        '''
-        t: (B, ) tensor of timesteps
-        y: (B, ) tensor of class labels
-        '''
-        t_emb = self.time_mlp(t)
-        y_emb = self.class_emb(y)
-        return t_emb + y_emb
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, cond_dim):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
-        self.cond_proj = nn.Linear(cond_dim, out_ch)
-        self.activation = nn.SiLU()
-
-    def forward(self, x, cond_emb):
-        h = self.activation(self.conv1(x))
-        h = h + self.cond_proj(cond_emb)[:, :, None, None]
-        h = self.activation(self.conv2(h))
-        return h
-
-
-class UnetDown(nn.Module):
-    def __init__(self, in_ch, out_ch, cond_dim):
-        super().__init__()
-        '''Downscale the image features'''
-        self.conv = ConvBlock(in_ch, out_ch, cond_dim)
-        self.pool = nn.MaxPool2d(2)
-
-    def forward(self, x, cond_emb):
-        x = self.conv(x, cond_emb)
-        skip = x
-        x = self.pool(x)
-        return x, skip
-
-
-class UnetUp(nn.Module):
-    def __init__(self, in_ch, out_ch, cond_dim):
-        super().__init__()
-        '''Upscale the image features'''
-        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
-        self.conv = ConvBlock(in_ch=out_ch*2, out_ch=out_ch, cond_dim=cond_dim)
-
-    def forward(self, x, skip, cond_emb):
-        x = self.up(x)
-        x = torch.cat([x, skip], dim=1) # concatenate along channel dimension
-        x = self.conv(x, cond_emb)
-        return x
-
-
-class UNet(nn.Module):
-    def __init__(self, in_ch=1, base_channels=128, num_classes=10, cond_dim=256):
-        super().__init__()
-
-        self.cond_embedding = TimeClassEmbedding(cond_dim, num_classes)
-
-        # encoder
-        self.down1 = UnetDown(in_ch, base_channels, cond_dim)
-        self.down2 = UnetDown(base_channels, base_channels * 2, cond_dim)
-        self.down3 = UnetDown(base_channels * 2, base_channels * 4, cond_dim)
-
-        # bottleneck
-        self.bottleneck = ConvBlock(base_channels * 4, base_channels * 8, cond_dim)
-
-        # decoder
-        self.up3 = UnetUp(base_channels * 8, base_channels * 4, cond_dim)
-        self.up2 = UnetUp(base_channels * 4, base_channels * 2, cond_dim)
-        self.up1 = UnetUp(base_channels * 2, base_channels, cond_dim)
-
-        # output
-        self.out_conv = nn.Conv2d(base_channels, in_ch, kernel_size=1)
-
-
-    def forward(self, x, t, y):
-        '''
-        x: (B, C, H, W) noisy image
-        t: (B, ) timesteps
-        y: (B, ) class labels
-        '''
-
-        cond_embed = self.cond_embedding(t, y)
-        x, s1 = self.down1(x, cond_embed)
-        x, s2 = self.down2(x, cond_embed)
-        x, s3 = self.down3(x, cond_embed)
-        x = self.bottleneck(x, cond_embed)
-
-        x = self.up3(x, s3, cond_embed)
-        x = self.up2(x, s2, cond_embed)
-        x = self.up1(x, s1, cond_embed)
-
-        return self.out_conv(x)
-
 
 class SimpleDiffusionModel(nn.Module):
     def __init__(self, T, num_channels=3, num_classes=10, device="cpu"):
@@ -164,11 +205,10 @@ class SimpleDiffusionModel(nn.Module):
         self.device = device
         self.initialize_alpha_beta_schedules()
 
-        self.unet = UNet(
-            in_ch=num_channels,
-            base_channels=128,
-            num_classes=num_classes,
-            cond_dim=256
+        self.unet = ContextUnet(
+            in_channels=num_channels,
+            n_feat=128,
+            n_classes=num_classes
         ).to(device)
 
     def forward(self, x, t, y):
@@ -235,15 +275,17 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    transform = transforms.Compose([transforms.Resize((32, 32)),
-                                    transforms.ToTensor(),
-                                    transforms.Normalize(mean=(0.5,), std=(0.5,))])
+    # transform = transforms.Compose([transforms.Resize((32, 32)),
+    #                                 transforms.ToTensor(),
+    #                                 transforms.Normalize(mean=(0.5,), std=(0.5,))])
+
+    transform = transforms.Compose([transforms.ToTensor()])
     training_data = datasets.MNIST(root='./data_src', train=True, download=True,transform=transform)
     test_data = datasets.MNIST(root='./data_src', train=False, download=True, transform=transform)
 
     # training_data = datasets.CIFAR10(root='./data_src', train=True, download=True, transform=transform)
     # test_data = datasets.CIFAR10(root='./data_src', train=False, download=True, transform=transform)
-    IMG_SHAPE = (1, 32, 32)
+    IMG_SHAPE = (1, 28, 28)
     training_dataloader = DataLoader(training_data,
                                      batch_size=B,
                                      shuffle=True,
@@ -257,8 +299,8 @@ if __name__ == "__main__":
     model = SimpleDiffusionModel(T, num_channels=IMG_SHAPE[0], num_classes=10, device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    train_writer = SummaryWriter(log_dir='runs/mnist/train')
-    test_writer = SummaryWriter(log_dir='runs/mnist/test')
+    train_writer = SummaryWriter(log_dir='runs/mnist/train_om')
+    test_writer = SummaryWriter(log_dir='runs/mnist/test_om')
 
     step = 0
     for epoch in range(epochs):

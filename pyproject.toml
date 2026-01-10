@@ -6,11 +6,7 @@ requires-python = ">=3.9"
 
 dependencies = [
     "matplotlib>=3.9.4",
-    "robosuite",
     "tensorboard>=2.20.0",
     "torch>=2.8.0",
     "torchvision>=0.23.0",
 ]
-
-[tool.uv.sources]
-robosuite = { path = "./robosuite" }
